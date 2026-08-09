@@ -1,0 +1,42 @@
+name: Release 1c-ai-mcp
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Build bundle
+        run: ./build.ps1
+
+      - name: Package zip
+        run: |
+          $tag = "${{ github.ref_name }}"
+          Compress-Archive -Path ./dist/1c-ai-mcp.js -DestinationPath "./1c-ai-mcp_$tag.zip" -Force
+          Write-Host "✅ 1c-ai-mcp_$tag.zip"
+
+      - name: Create Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = "${{ github.ref_name }}"
+          gh release delete $tag --yes 2>$null
+          gh release create $tag `
+            "./1c-ai-mcp_$tag.zip"
