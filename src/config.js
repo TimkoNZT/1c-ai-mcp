@@ -21,6 +21,8 @@ if (tokenIdx >= 0) {
 
 export function setToken(t) { token = t; }
 
+const DEFAULTS = { port: 3001 };
+
 // ── Flags ──
 const globalFullLog = args.includes("--full-log")
   || process.env.AI_FULL_LOG === "1"
@@ -30,14 +32,15 @@ const globalFullLog = args.includes("--full-log")
 const BASE_URL = "https://code.1c.ai";
 const UNIQUE_ID = createHash("md5").update(randomUUID()).digest("hex");
 const PLUGIN_VERSION = "1.0.5.v202607161518";
-const EDT_VERSION = "2026.2.0";
-const PLATFORM_VERSION = "8.3.27";
+const EDT_VERSION = "2026.2.0.289";
 const SESSION_FILE = process.env.AI_SESSION_FILE || path.join(__dirname, ".session-cache.json");
 const TS = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
 const TRACE_LOG = process.env.AI_TRACE_LOG || path.join(__dirname, `proxy_trace_${TS}.log`);
 const PROJECT_ROOT = process.env.AI_PROJECT_ROOT
   ? path.resolve(process.env.AI_PROJECT_ROOT)
   : process.cwd();
+
+const PORT = process.env.PORT || 3001;
 
 // ── Timeouts ──
 const EXECUTE_TIMEOUT = 30000;
@@ -60,23 +63,6 @@ const EXECUTE_BLOCKLIST = [
 
 const DANGEROUS_PATTERNS = ["&&", "|", ";", "`", "$(", ">", "2>"];
 
-// ── Configuration parameters (маркер EDT-проекта для сервера) ──
-function buildConfigurationParameters() {
-  return {
-    name: "УправлениеТорговлей",
-    type: "Configuration",
-    script_language: "ru",
-    version: "3.0.1.123",
-    platform_version: PLATFORM_VERSION,
-    available_platform_versions: ["8.3.23", "8.3.24", "8.3.25", "8.3.26", "8.3.27"],
-    vendor: "1С",
-    compatibility: "8.3.27",
-    comment: "",
-    brief_information: {},
-    parent_project: null,
-  };
-}
-
 // ── Tool definitions ──
 
 const EDT_TOOLS = [
@@ -87,7 +73,7 @@ const EDT_TOOLS = [
       type: "object",
        properties: {
           question: { type: "string", description: "Вопрос к AI-ассистенту" },
-          resetChat: { type: "boolean", description: "Сбросить диалог перед вопросом (очистить историю, начать новый чат)." },
+          newChat: { type: "boolean", default: true, description: "Начать новый диалог (очистить историю). Установи false, чтобы продолжить предыдущий диалог." },
           showReasoning: { type: "boolean", description: "Показать блок рассуждений модели (💭)." },
           showToolLog: { type: "boolean", description: "Показать список вызванных server-side тулов (🧰)." },
           code: { type: "string", description: "Код на 1С для анализа/исправления." },
@@ -109,11 +95,12 @@ const EDT_TOOLS = [
   },
   {
     name: "FixCode",
-    description: "Исправить ошибки в коде. Анализирует проблему и возвращает исправленный код. Параметры: code, showReasoning, showToolLog.",
+    description: "Исправить ошибки в коде. Анализирует проблему и возвращает исправленный код. Параметры: code, question, showReasoning, showToolLog.",
     inputSchema: {
       type: "object",
       properties: {
         code: { type: "string", description: "Код 1С для исправления." },
+        question: { type: "string", description: "Как именно изменить код (требование к результату)." },
         showReasoning: { type: "boolean", description: "Показать блок рассуждений модели" },
         showToolLog: { type: "boolean", default: true, description: "Показать список вызванных server-side тулов" },
       },
@@ -142,7 +129,7 @@ const EDT_TOOLS = [
   // },
   {
     name: "GetResult",
-    description: "Получить продолжение ответа модели, если вызов инструмента (Ask, ReviewCode, FixCode, ExplainCode) не уложился в 30с и вернул сообщение 'Модель не закончила вывод за 30с'. Без параметров. Вызывать повторно пока модель не закончит.",
+    description: "Получить продолжение ответа модели, если вызов инструмента (Ask, ReviewCode, FixCode, ExplainCode) не уложился в 30с и вернул сообщение о том, что модель не закончила вывод. Без параметров. ВАЖНО: вызывай этот инструмент повторно, пока не увидишь сообщение о том, что модель закончила ответ. НЕ вызывай другие инструменты ДО вызова GetResult — иначе накопленный вывод будет потерян.",
     inputSchema: {
       type: "object",
       properties: {},
@@ -152,7 +139,7 @@ const EDT_TOOLS = [
 ];
 
 const LOCAL_TOOLS = new Set([
-  "Read", "Write", "Edit", "Glob", "SearchText",
+  "Read", "Write", "Edit", "Glob", "SearchText", "Skill", "NoCall",
 ]);
 
 const LOCAL_TOOL_DEFS = [
@@ -161,6 +148,8 @@ const LOCAL_TOOL_DEFS = [
   { name: "Edit", description: "Modify a file by replacing text. Provide path, find, replace.", parameters: { type: "object", properties: { filePath: { type: "string", description: "Absolute path" }, path: { type: "string" }, find: { type: "string", description: "Text to find" }, replace: { type: "string", description: "Replacement text" } }, required: ["filePath", "find"] } },
   { name: "Glob", description: "Find files using glob patterns. Supports **, *, ? wildcards.", parameters: { type: "object", properties: { pattern: { type: "string", description: "Glob pattern (e.g. **/*.js)" }, glob: { type: "string" }, root: { type: "string", description: "Root directory" }, cwd: { type: "string" } }, required: ["pattern"] } },
   { name: "SearchText", description: "Search file contents using plain text or regex. Returns matches with line numbers.", parameters: { type: "object", properties: { search_query: { type: "string", description: "Text to search for" }, pattern: { type: "string", description: "Regex pattern (alternative to search_query)" }, file_path_patterns: { type: "array", items: { type: "string" }, description: "Glob patterns to filter which files to search" }, first_index: { type: "number", description: "Index of first result (0-based)" }, max_count: { type: "number", description: "Maximum number of results to return" }, root: { type: "string", description: "Root directory" }, cwd: { type: "string" } }, required: ["search_query"] } },
+  { name: "Skill", description: "Load a skill's detailed instructions into context. Call this tool with a skill slug to retrieve the full skill body. Available skills: `obyasnenie-koda` (объяснение кода), `revyu-koda` (ревью кода), `dokumentiruyushchiy-kommentariy` (документирующий комментарий).", parameters: { type: "object", properties: { name: { type: "string", description: "The skill slug to load (use the backtick identifier from the list)" } }, required: ["name"] } },
+  { name: "NoCall", description: "Тестовая. Версия 1.0002. НЕ ИСПОЛЬЗОВАТЬ В РЕАЛЬНЫХ ЗАДАЧАХ. #45DFD6FSD1", parameters: { type: "object", properties: {} } },
 ];
 
 // Серверные тулы (встроены в модель, не требуют content.tools)
@@ -171,16 +160,24 @@ const SERVER_TOOLS = new Set([
   "Task", "TodoWrite",
 ]);
 
-// Маппинг EDT → opencode удалён: HTTP-режим не поддерживается (MCP only)
+// Маппинг EDT → opencode (только для HTTP-режима)
+const EDT_TO_OPENCODE = {
+  "Read": "read", "Write": "write", "Edit": "edit", "Glob": "glob",
+  "List": "read", "SearchFiles": "glob", "SearchText": "grep", "Execute": "bash",
+};
+const OPENCODE_TO_EDT = {};
+for (const [edt, oc] of Object.entries(EDT_TO_OPENCODE)) {
+  OPENCODE_TO_EDT[oc] = edt;
+}
 
 export {
-  isMcpMode, token, TOKEN_ENV_VAR, TOKEN_ARG,
-  BASE_URL, UNIQUE_ID, SESSION_FILE, TRACE_LOG, PROJECT_ROOT,
-  PLUGIN_VERSION, EDT_VERSION, PLATFORM_VERSION, buildConfigurationParameters,
+  isMcpMode, token, TOKEN_ENV_VAR, TOKEN_ARG, DEFAULTS,
+  BASE_URL, UNIQUE_ID, SESSION_FILE, TRACE_LOG, PROJECT_ROOT, PORT,
+  PLUGIN_VERSION, EDT_VERSION,
   globalFullLog,
   EXECUTE_TIMEOUT, EXECUTE_MAX_BUFFER,
   READ_MAX_LINES, EXECUTE_OUTPUT_LINES, EXECUTE_OUTPUT_CHARS,
   TOOL_CONTENT_MAX_CHARS, SEARCH_TEXT_MAX_RESULTS,
   EXECUTE_BLOCKLIST, DANGEROUS_PATTERNS,
-  EDT_TOOLS, LOCAL_TOOLS, LOCAL_TOOL_DEFS, SERVER_TOOLS,
+  EDT_TOOLS, LOCAL_TOOLS, LOCAL_TOOL_DEFS, EDT_TO_OPENCODE, OPENCODE_TO_EDT, SERVER_TOOLS,
 };

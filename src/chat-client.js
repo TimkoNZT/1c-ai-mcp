@@ -1,18 +1,24 @@
-import { token, BASE_URL, LOCAL_TOOLS, LOCAL_TOOL_DEFS, TOOL_CONTENT_MAX_CHARS, UNIQUE_ID, PLUGIN_VERSION, EDT_VERSION } from "./config.js";
+import { token, BASE_URL, LOCAL_TOOLS, LOCAL_TOOL_DEFS, TOOL_CONTENT_MAX_CHARS } from "./config.js";
 import { trace, log } from "./logger.js";
-import { getSession, RetrySessionError, resetSession, addConversation, removeConversation, sleep } from "./session.js";
+import { RetrySessionError, resetSession, addConversation, removeConversation, sleep } from "./session.js";
 import { executeLocalTool } from "./tools.js";
 import { createSSEReader } from "./sse-reader.js";
 
-function edtHeaders(sid) {
+export function chatHeaders(accept) {
   return {
     Authorization: token,
-    "Unique-Id": UNIQUE_ID,
-    "Session-Id": sid,
     "Content-Type": "application/json",
-    Accept: "application/json",
-    "plugin_version": PLUGIN_VERSION,
-    "EDT_version": EDT_VERSION,
+    Accept: accept || "*/*",
+    "Accept-Charset": "ISO-8859-1,utf-8;q=0.7,*;q=0.7",
+    "Accept-Encoding": "gzip, inflate",
+    "Accept-Language": "ru-ru,en-us;q=0.8,en;q=0.7",
+    Origin: BASE_URL,
+    Referer: `${BASE_URL}/chat/`,
+    "Sec-Fetch-Dest": "empty",
+    "Sec-Fetch-Mode": "cors",
+    "Sec-Fetch-Site": "same-origin",
+    "Session-Id": "",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/622.1 (KHTML, like Gecko) JavaFX/25 Version/18.4 Safari/622.1",
   };
 }
 
@@ -68,13 +74,21 @@ export class ChatClient {
     return this.convUuid ? { uuid: this.convUuid, lastAssistantUuid: this.lastAssistantUuid } : null;
   }
 
-  async createConversation(skillName = "raw", title) {
-    const sid = await getSession();
+  async createConversation(skillName = "custom", title) {
     log(`  💬 askAI: создание конверсации (skill=${skillName})...`);
+    const isSkill = skillName !== "custom";
+    const convBody = {
+      skill_name: skillName,
+      ui_language: "russian",
+      programming_language: isSkill ? "1с" : "",
+      is_chat: true,
+      user_instruct: { common_rules: null, workspace_rules: null, projects_rules: {} },
+    };
+    if (isSkill) convBody.script_language = "Russian";
     const res = await fetch(`${BASE_URL}/chat_api/v1/conversations/`, {
       method: "POST",
-      headers: edtHeaders(sid),
-      body: JSON.stringify({ skill_name: skillName, ui_language: "ru", programming_language: "1c", script_language: "ru", is_chat: false }),
+      headers: chatHeaders(),
+      body: JSON.stringify(convBody),
     });
     trace("conv_create", { skillName, title, status: res.status });
     if (!res.ok) {
@@ -90,7 +104,7 @@ export class ChatClient {
       try {
         await fetch(`${BASE_URL}/chat_api/v1/conversations/${this.convUuid}/title`, {
           method: "PUT",
-          headers: edtHeaders(sid),
+          headers: chatHeaders(),
           body: JSON.stringify({ title: title.slice(0, 100) }),
         });
       } catch { /* ignore errors on title set */ }
@@ -102,10 +116,32 @@ export class ChatClient {
     return this.convUuid;
   }
 
-  async sendUserMessage(text, code) {
-    const sid = await getSession();
-    const content = { code: code ? [{ content: code, path: "/" }] : [] };
-    if (text) content.instruction = text;
+  async sendUserMessage(text, code, skillName) {
+    const isSkill = skillName && skillName !== "custom";
+    let content;
+    if (isSkill) {
+      content = {
+        code: code ? [{ content: code, path: "/" }] : [],
+        local_context: {
+          prefix: "",
+          suffix: code || "",
+          path: "/",
+          offset: 0,
+          forced: false,
+          content_assist: false,
+          programing_language: "1с",
+          cursor_object: "",
+          current_method: "",
+          cursor_environments: ["THIN_CLIENT", "MNG_CLIENT", "MOBILE_CLIENT", "WEB_CLIENT", "MOBILE_THIN_CLIENT", "CLIENT"],
+          related_objects: [],
+          related_functions: [],
+        },
+      };
+      if (text) content.instruction = text;
+    } else {
+      content = {};
+      if (text) content.instruction = text;
+    }
 
     const body = {
       parent_uuid: this.lastAssistantUuid,
@@ -116,7 +152,7 @@ export class ChatClient {
     trace("send_msg_req", { parentUuid: this.lastAssistantUuid, body });
     const res = await fetch(`${BASE_URL}/chat_api/v1/conversations/${this.convUuid}/messages`, {
       method: "POST",
-      headers: { Authorization: token, "Session-Id": sid, "Content-Type": "application/json", Accept: "text/event-stream" },
+      headers: chatHeaders("text/event-stream"),
       body: JSON.stringify(body),
     });
     if (!res.ok) {
@@ -129,7 +165,6 @@ export class ChatClient {
   }
 
   async sendToolAck(assistantUuid, calls) {
-    const sid = await getSession();
     const serverCalls = [];
     const results = [];
 
@@ -162,7 +197,7 @@ export class ChatClient {
       trace("tool_result_req", { names: results.map(r => r.name), body });
     const res = await fetch(`${BASE_URL}/chat_api/v1/conversations/${this.convUuid}/messages`, {
       method: "POST",
-      headers: { ...edtHeaders(sid), Accept: "text/event-stream" },
+      headers: chatHeaders("text/event-stream"),
       body: JSON.stringify(body),
     });
       if (!res.ok) {
@@ -187,7 +222,7 @@ export class ChatClient {
     trace("tool_ack_req", { names: serverCalls.map(t => t.function?.name || t.name), body });
     const res = await fetch(`${BASE_URL}/chat_api/v1/conversations/${this.convUuid}/messages`, {
       method: "POST",
-      headers: { ...edtHeaders(sid), Accept: "text/event-stream" },
+      headers: chatHeaders("text/event-stream"),
       body: JSON.stringify(body),
     });
     if (!res.ok) {
@@ -377,12 +412,12 @@ export class ChatClient {
             await this.deleteConversation().catch(() => {});
             this.convUuid = null; this.lastAssistantUuid = null;
           }
-          await this.createConversation(opts.skillName || "raw", opts.title);
+          await this.createConversation(opts.skillName || "custom", opts.title);
         } else {
           log(`  💬 askAI: конверсация ${this.convUuid.slice(0, 8)}… (существующая)`);
         }
 
-        const res = await this.sendUserMessage(question, code);
+        const res = await this.sendUserMessage(question, code, opts.skillName);
         deferredState.opts = { showReasoning, showToolLog, stripMarkdown: true };
         deferredState.active = true;
         deferredState.segments = [];
@@ -451,10 +486,9 @@ export class ChatClient {
     const uuid = this.convUuid;
     this.convUuid = null;
     removeConversation(uuid);
-    const sid = await getSession();
     await fetch(`${BASE_URL}/chat_api/v1/conversations/${uuid}`, {
       method: "DELETE",
-      headers: edtHeaders(sid),
+      headers: chatHeaders(),
     });
   }
 }
@@ -606,7 +640,7 @@ function buildResult(allSegments, toolCalls, { showReasoning, showToolLog, strip
             if (!id) continue;
             if (toolLastIdx.get(id) !== i) continue;
             const name = r.tool_name;
-            if (name === "mcp__knowledge-hub__Fetch_ITS" || name === "TodoWrite") continue;
+            if (name === "mcp__knowledge-hub__Fetch_ITS" || name === "TodoWrite" || name === "Skill" || name === "NoCall") continue;
             const entry = calls.get(id);
             if (!entry) continue;
             if (showToolLog) {

@@ -169,6 +169,20 @@ export function executeLocalTool(toolName, args) {
       const total = results.length;
       return { content: sliced.join("\n") + (total > firstIndex + maxCount ? `\n... (${total - firstIndex - maxCount} more)` : "") || "No matches" };
     }
+    case "Skill": {
+      const name = (args.name || args.skill || args.skill_id || "").toLowerCase();
+      const skills = {
+        "obyasnenie-koda": "Объяснение кода.\n\nОпиши функциональность предоставленного кода на фактах, без предположений о невидимых определениях. Для платформенных методов используй mcp__knowledge-hub__Search_Documentation.\n\nТребования к ответу:\n- Опиши назначение кода, входные параметры, возвращаемое значение и ключевую логику.\n- Для модуля: назначение и экспортные процедуры/функции.\n- Для diff: текст для commit message.\n- Объективность, корректная терминология 1С.",
+        "revyu-koda": "Ревью кода.\n\nПроверь код на ошибки, проблемы производительности и соответствие стандартам.\n\n1. Валидация: если возможно, проверь синтаксис через mcp__syntax-checker__validate.\n2. Статический анализ: проверь вызовы процедур/функций и метаданных.\n3. Стандарты: сверяйся с требованиями 1С, при необходимости используй mcp__knowledge-hub__Search_Documentation.\n\nТребования к отчёту:\n- Кратко и по делу.\n- Перечисли проблемы: ошибки, несоответствия стандартам, подозрительные вызовы.\n- Укажи строки (если применимо) и суть проблемы.\n- Для diff — проанализируй изменения в контексте, оцени корректность логики.\n- Отступы: табуляция.",
+        "dokumentiruyushchiy-kommentariy": "Документирующий комментарий.\n\nСформируй документирующий комментарий для метода 1С в формате EDT: описание, параметры с типами, возвращаемое значение.\n\nСоблюдай стандарт документирующих комментариев 1С:Предприятия. Требования к выходному тексту — готовый блок комментария, который можно вставить перед методом.",
+      };
+      const skill = skills[name];
+      if (!skill) throw new Error(`Skill: unknown skill "${name}"`);
+      return { content: skill };
+    }
+    case "NoCall": {
+      return { content: "" };
+    }
     default:
       throw new Error(`Unknown local tool: ${toolName}`);
   }

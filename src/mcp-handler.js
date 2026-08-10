@@ -1,7 +1,7 @@
-import { token, BASE_URL, EDT_TOOLS } from "./config.js";
+import { BASE_URL, EDT_TOOLS } from "./config.js";
 import { log } from "./logger.js";
-import { loadSessionCache, getCachedSession, getAllConversations, clearConversations, clearToolConversations, saveAskConv, getAskConv, clearAskConv } from "./session.js";
-import { ChatClient, deferredState, getDeferredResult } from "./chat-client.js";
+import { loadSessionCache, getAllConversations, clearConversations, clearToolConversations, saveAskConv, getAskConv, clearAskConv } from "./session.js";
+import { ChatClient, deferredState, getDeferredResult, chatHeaders } from "./chat-client.js";
 const DEFERRED_MSG = "⚠️ **Модель не закончила вывод.** Подожди несколько секунд и вызови **GetResult**";
 let toolQueue = Promise.resolve();
 
@@ -32,7 +32,7 @@ async function resetAskChat() {
 async function _callMcpTool(toolName, toolContent) {
   switch (toolName) {
     case "Ask": {
-      if (toolContent?.resetChat) {
+      if (toolContent?.newChat !== false) {
         await resetAskChat();
       }
       if (!askClient) {
@@ -82,13 +82,18 @@ async function chatTool(client, toolName, toolContent, freshConv) {
   const question = toolContent?.question || "";
 
   const skillMap = {
-    "Ask": "raw",
+    "Ask": "custom",
     "ReviewCode": "review",
     "FixCode": "modify",
     "ExplainCode": "explain",
   };
-  const skillName = skillMap[toolName] || "raw";
-  const defaultInstruction = toolName === "FixCode" ? "Найди ошибки в коде" : "";
+  const skillName = skillMap[toolName] || "custom";
+
+  const defaultInstruction = {
+    "ReviewCode": "Проведи ревью кода: ошибки, проблемы производительности, нарушения стандартов. Перечисли замечания по пунктам со строками. НЕ исправляй код.",
+    "FixCode": "Найди и исправь ошибки в коде. Верни исправленный код целиком и кратко поясни изменения.",
+    "ExplainCode": "Объясни, что делает код: назначение, логику по шагам, ключевые переменные. Простым языком. НЕ исправляй и НЕ ищи ошибки.",
+  }[toolName] || "";
 
   const snippet = (code || question || "").replace(/\s+/g, " ").slice(0, 30);
   const titleMap = {
@@ -108,25 +113,25 @@ async function chatTool(client, toolName, toolContent, freshConv) {
     deferredMs: 30000,
   };
 
-  return await client.ask(question || defaultInstruction, code, opts);
+  const instruction = toolName === "FixCode" ? (question || defaultInstruction) : (question || "");
+  return await client.ask(instruction, code, opts);
 }
 
 async function cleanupOrphanedConversations() {
   const convs = getAllConversations();
   if (!convs.length) return;
 
-  // Удаляем только tool-чаты. Ask (skill=raw/custom) сохраняем.
-  const ASK_SKILLS = new Set(["raw", "custom"]);
+  // Удаляем только tool-чаты. Ask (skill=custom) сохраняем.
+  const ASK_SKILLS = new Set(["custom"]);
   const toolConvs = convs.filter(c => !ASK_SKILLS.has(c.skill));
   if (!toolConvs.length) return;
 
   log(`  🧹 Очистка ${toolConvs.length} осиротевших tool-конверсаций...`);
-  const sid = getCachedSession();
   for (const c of toolConvs) {
     try {
       const res = await fetch(`${BASE_URL}/chat_api/v1/conversations/${c.uuid}`, {
         method: "DELETE",
-        headers: { Authorization: token, "Session-Id": sid || "" },
+        headers: chatHeaders(),
       });
       if (res.ok) log(`    ✓ удалена: ${c.uuid.slice(0, 8)}… (${c.title || "без названия"})`);
       else if (res.status === 404) log(`    - уже удалена: ${c.uuid.slice(0, 8)}…`);

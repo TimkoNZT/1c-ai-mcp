@@ -39,4 +39,6 @@ jobs:
           $tag = "${{ github.ref_name }}"
           gh release delete $tag --yes 2>$null
           gh release create $tag `
+            --title "$tag" `
+            --notes "" `
             "./1c-ai-mcp_$tag.zip"

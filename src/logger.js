@@ -1,5 +1,5 @@
-import { writeFileSync, appendFileSync } from "fs";
-import { TRACE_LOG } from "./config.js";
+import { appendFileSync } from "fs";
+import { TRACE_LOG, globalFullLog } from "./config.js";
 
 export function clearTrace() {
   // Каждый запуск прокси создаёт новый файл с timestamp — очистка не нужна
@@ -16,6 +16,7 @@ function truncateStrings(obj, maxLen) {
 }
 
 export function trace(label, data) {
+  if (!globalFullLog) return;
   const ts = new Date().toISOString();
   const safe = truncateStrings(data, 1000);
   const line = `\n=== ${ts} [${label}] ===\n${JSON.stringify(safe, null, 2)}\n`;

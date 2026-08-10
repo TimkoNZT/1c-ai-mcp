@@ -44,10 +44,16 @@ foreach ($f in $src) {
   $bodyParts += $c.TrimStart()
 }
 
+$repoUrl = "https://github.com/TimkoNZT/1c-ai-mcp"
+$author  = "TimkoNZT"
 $output = @(
   '#!/usr/bin/env node'
   '// Zero-dependency bundle — MCP only'
   "// Generated: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
+  "//"
+  "// Source: $repoUrl"
+  "// Author: $author"
+  "// License: MIT"
   ''
   ($builtinLines -join "`n")
   ''

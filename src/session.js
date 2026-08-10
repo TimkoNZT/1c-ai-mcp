@@ -1,5 +1,5 @@
 import { existsSync, readFileSync, writeFileSync, rmSync } from "fs";
-import { token, BASE_URL, UNIQUE_ID, SESSION_FILE, PLUGIN_VERSION, EDT_VERSION, buildConfigurationParameters } from "./config.js";
+import { token, BASE_URL, UNIQUE_ID, SESSION_FILE, PLUGIN_VERSION, EDT_VERSION } from "./config.js";
 import { trace, log } from "./logger.js";
 
 export class RetrySessionError extends Error {
@@ -63,7 +63,7 @@ export function clearConversations() {
 
 export function clearToolConversations() {
   const before = knownConversations.length;
-  const askSkills = new Set(["raw", "custom"]);
+  const askSkills = new Set(["custom"]);
   knownConversations = knownConversations.filter(c => askSkills.has(c.skill));
   if (knownConversations.length !== before) saveSessionCache();
 }
@@ -100,30 +100,23 @@ export async function getSession() {
     const res = await fetch(`${BASE_URL}/api/v1/create_session`, {
       method: "POST",
       headers: {
+        "User-Agent": "Java-http-client/25.0.2",
+        Accept: "application/json",
+        "Content-Type": "application/json",
         Authorization: token,
         "Unique-Id": UNIQUE_ID,
-        "Content-Type": "application/json",
-        Accept: "application/json",
         "plugin_version": PLUGIN_VERSION,
         "EDT_version": EDT_VERSION,
       },
       body: JSON.stringify({
         service_parameters: {
-          url: BASE_URL,
-          chat_url: BASE_URL + "chat/",
-          timeout: 15000,
-          min_delay: 300,
-          verbosity: "warning",
-          git_diff_context_lines: 8,
           stop: [],
-          prefix_length: 1000,
-          suffix_length: 500,
-          global_context: false,
-          experimental: false,
+          url: BASE_URL + "/",
+          update_url: BASE_URL + "/plugin/",
         },
         user_parameters: {
-          plugin_version: PLUGIN_VERSION,
           edt_version: EDT_VERSION,
+          plugin_version: PLUGIN_VERSION,
           tab_width: 4,
           code_completion_lines_count: 10,
           code_completion_policy: "moderate",
@@ -132,17 +125,14 @@ export async function getSession() {
           timeout_ms: 15000,
           line_separator: "\r\n",
           language: "Russian",
-          global_context: false,
-          experimental: false,
-          configuration_parameters: buildConfigurationParameters(),
         },
         system_info: {
           os_name: "Windows 11",
           os_version: "10.0",
           arch: "amd64",
           available_processors: 16,
-          processor_name: "Intel64 Family 6 Model 186 Stepping 3, GenuineIntel",
-          total_physical_memory_size: 34078701568,
+          processor_name: "Intel64 Family 6 Model 151 Stepping 2, GenuineIntel",
+          total_physical_memory_size: 34088288256,
         },
       }),
     });
