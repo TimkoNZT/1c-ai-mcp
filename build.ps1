@@ -10,22 +10,29 @@ $distDir = Join-Path $proxyDir "dist"
 $null = New-Item -ItemType Directory -Path $distDir -Force
 $outPath = Join-Path $distDir "1c-ai-mcp.js"
 
-$builtinLines = @()   # deduplicated Node.js builtin imports
-$seenMod = @{}        # module name -> true
+$builtinLines = @()   # merged Node.js builtin imports (all named from each module)
+$importNames = @{}    # module name -> set of named imports
+$importNs = @{}       # module name -> namespace alias (first wins)
 $bodyParts = @()
 
 foreach ($f in $src) {
   $c = Get-Content (Join-Path $srcDir $f) -Raw -Encoding UTF8
 
   # --- Extract builtin imports (before stripping) ---
-  $imports = [regex]::Matches($c, '(?m)^import\s+[\s\S]*?from\s+"([^"]+)"\s*;')
+  # Forms handled: import { a, b } from "mod";  import * as ns from "mod";
+  $imports = [regex]::Matches($c, '(?m)^import\s+(.+?)\s+from\s+"([^"]+)"\s*;')
   foreach ($m in $imports) {
-    $full = $m.Value.Trim()
-    $mod = $m.Groups[1].Value
+    $clause = $m.Groups[1].Value.Trim()
+    $mod = $m.Groups[2].Value
     if ($mod.StartsWith(".")) { continue }  # skip local
-    if (-not $seenMod.ContainsKey($mod)) {
-      $seenMod[$mod] = $true
-      $builtinLines += $full
+    if ($clause -match '^\{\s*(.+?)\s*\}$') {
+      if (-not $importNames.ContainsKey($mod)) { $importNames[$mod] = @{} }
+      foreach ($n in ($clause -replace '^\{\s*', '' -replace '\s*\}$', '' -split ',')) {
+        $nm = $n.Trim()
+        if ($nm) { $importNames[$mod][$nm] = $true }
+      }
+    } elseif ($clause -match '^\*\s+as\s+([A-Za-z_$][\w$]*)$') {
+      if (-not $importNs.ContainsKey($mod)) { $importNs[$mod] = $Matches[1] }
     }
   }
 
@@ -43,6 +50,18 @@ foreach ($f in $src) {
 
   $bodyParts += $c.TrimStart()
 }
+
+# --- Compose merged import lines per module (across all files) ---
+foreach ($mod in @($importNames.Keys | Sort-Object)) {
+  $names = @($importNames[$mod].Keys | Sort-Object)
+  if ($names.Count -gt 0) {
+    $builtinLines += "import { $($names -join ', ') } from `"$mod`";"
+  }
+}
+foreach ($mod in @($importNs.Keys | Sort-Object)) {
+  $builtinLines += "import * as $($importNs[$mod]) from `"$mod`";"
+}
+$builtinLines = @($builtinLines | Sort-Object -Unique)
 
 $repoUrl = "https://github.com/TimkoNZT/1c-ai-mcp"
 $author  = "TimkoNZT"
