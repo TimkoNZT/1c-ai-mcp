@@ -1,7 +1,8 @@
-import { BASE_URL, EDT_TOOLS } from "./config.js";
+import { EDT_TOOLS } from "./config.js";
 import { log } from "./logger.js";
 import { loadSessionCache, getAllConversations, clearConversations, clearToolConversations, saveAskConv, getAskConv, clearAskConv } from "./session.js";
-import { ChatClient, deferredState, getDeferredResult, chatHeaders } from "./chat-client.js";
+import { ChatClient, getJobResult, activeJob, dropJobs } from "./chat-client.js";
+import { deleteConversationRequest } from "./transport.js";
 const DEFERRED_MSG = "⚠️ **Модель не закончила вывод.** Подожди несколько секунд и вызови **GetResult**";
 let toolQueue = Promise.resolve();
 
@@ -20,8 +21,8 @@ async function callMcpTool(toolName, toolContent) {
 }
 
 async function resetAskChat() {
-  deferredState.active = false;
-  deferredState.finished = true;
+  // Сброс ask-сессии: старые задания и диалог больше не нужны.
+  dropJobs(job => job.kind === "ask");
   if (askClient) {
     await askClient.deleteConversation().catch(() => {});
     askClient = null;
@@ -34,6 +35,11 @@ async function _callMcpTool(toolName, toolContent) {
     case "Ask": {
       if (toolContent?.newChat !== false) {
         await resetAskChat();
+      } else {
+        const running = activeJob("ask");
+        if (running) {
+          return `⚠️ Предыдущий запрос ещё выполняется. request_id: ${running.id}. Вызови **GetResult** с этим id.`;
+        }
       }
       if (!askClient) {
         askClient = new ChatClient();
@@ -44,7 +50,7 @@ async function _callMcpTool(toolName, toolContent) {
       const state = askClient.getConvState();
       if (state) saveAskConv(state.uuid, state.lastAssistantUuid);
       if (result.deferred) {
-        return DEFERRED_MSG + "\n\n" + result.text;
+        return `${DEFERRED_MSG}\n\nrequest_id: ${result.jobId}\n\n${result.text}`.trim();
       }
       return result.text;
     }
@@ -55,7 +61,7 @@ async function _callMcpTool(toolName, toolContent) {
       const client = new ChatClient();
       const result = await chatTool(client, toolName, toolContent, true);
       if (result.deferred) {
-        return DEFERRED_MSG + "\n\n" + result.text;
+        return `${DEFERRED_MSG}\n\nrequest_id: ${result.jobId}\n\n${result.text}`.trim();
       }
       return result.text;
     }
@@ -66,8 +72,12 @@ async function _callMcpTool(toolName, toolContent) {
     // }
 
     case "GetResult": {
-      const res = getDeferredResult();
+      const res = await getJobResult({
+        requestId: toolContent?.request_id,
+        waitSeconds: toolContent?.wait_seconds,
+      });
       if (!res) return "Нет активного отложенного запроса. Используй Ask / ReviewCode / FixCode / ExplainCode, и если модель не уложится в 30с, вызывай GetResult.";
+      if (res.error) throw res.error;
       if (!res.text && res.finished) return "✅ Модель закончила ответ.";
       return res.text;
     }
@@ -106,14 +116,16 @@ async function chatTool(client, toolName, toolContent, freshConv) {
 
   const opts = {
     showReasoning: toolContent?.showReasoning,
-    showToolLog: toolContent?.showToolLog,
+    showToolLog: toolContent?.showToolLog ?? (toolName === "Ask" ? false : true),
+    showContext: toolName === "Ask",
+    kind: toolName === "Ask" ? "ask" : "tool",
     skillName,
     freshConv,
     title,
     deferredMs: 30000,
   };
 
-  const instruction = toolName === "FixCode" ? (question || defaultInstruction) : (question || "");
+  const instruction = question || defaultInstruction;
   return await client.ask(instruction, code, opts);
 }
 
@@ -129,13 +141,13 @@ async function cleanupOrphanedConversations() {
   log(`  🧹 Очистка ${toolConvs.length} осиротевших tool-конверсаций...`);
   for (const c of toolConvs) {
     try {
-      const res = await fetch(`${BASE_URL}/chat_api/v1/conversations/${c.uuid}`, {
-        method: "DELETE",
-        headers: chatHeaders(),
-      });
-      if (res.ok) log(`    ✓ удалена: ${c.uuid.slice(0, 8)}… (${c.title || "без названия"})`);
-      else if (res.status === 404) log(`    - уже удалена: ${c.uuid.slice(0, 8)}…`);
-      else log(`    ? ${res.status}: ${c.uuid.slice(0, 8)}…`);
+      try {
+        await deleteConversationRequest(c.uuid);
+        log(`    ✓ удалена: ${c.uuid.slice(0, 8)}… (${c.title || "без названия"})`);
+      } catch (err) {
+        if (err.status === 404) log(`    - уже удалена: ${c.uuid.slice(0, 8)}…`);
+        else log(`    ? ${err.message}: ${c.uuid.slice(0, 8)}…`);
+      }
     } catch { /* ignore network errors on cleanup */ }
   }
   clearToolConversations();
@@ -184,7 +196,7 @@ export async function mcpMain() {
           mcpRespond(id, {
             protocolVersion: params?.protocolVersion || "2025-11-25",
             capabilities: { tools: {} },
-            serverInfo: { name: "1c-ai-mcp", version: "1.0.0" },
+            serverInfo: { name: "1c-ai-mcp", version: "1.05" },
           });
           break;
 

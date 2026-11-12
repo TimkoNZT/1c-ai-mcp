@@ -1,26 +1,19 @@
-import { token, BASE_URL, LOCAL_TOOLS, LOCAL_TOOL_DEFS, TOOL_CONTENT_MAX_CHARS } from "./config.js";
+import { LOCAL_TOOLS, TOOL_CONTENT_MAX_CHARS } from "./config.js";
+import { randomUUID } from "crypto";
 import { trace, log } from "./logger.js";
 import { RetrySessionError, resetSession, addConversation, removeConversation, sleep } from "./session.js";
 import { executeLocalTool } from "./tools.js";
 import { createSSEReader } from "./sse-reader.js";
+import {
+  TRANSPORT_CAPABILITIES,
+  createConversationRequest,
+  setConversationTitle,
+  sendUserMessageRequest,
+  sendToolResultsRequest,
+  deleteConversationRequest,
+  ApiError,
+} from "./transport.js";
 
-export function chatHeaders(accept) {
-  return {
-    Authorization: token,
-    "Content-Type": "application/json",
-    Accept: accept || "*/*",
-    "Accept-Charset": "ISO-8859-1,utf-8;q=0.7,*;q=0.7",
-    "Accept-Encoding": "gzip, inflate",
-    "Accept-Language": "ru-ru,en-us;q=0.8,en;q=0.7",
-    Origin: BASE_URL,
-    Referer: `${BASE_URL}/chat/`,
-    "Sec-Fetch-Dest": "empty",
-    "Sec-Fetch-Mode": "cors",
-    "Sec-Fetch-Site": "same-origin",
-    "Session-Id": "",
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/622.1 (KHTML, like Gecko) JavaFX/25 Version/18.4 Safari/622.1",
-  };
-}
 
 /**
  * Санитизация текста: NFKC-нормализация + удаление управляющих ASCII-символов,
@@ -30,29 +23,194 @@ export function sanitizeText(text) {
   return text ? text.normalize("NFKC").replace(/\\t/g, "").replace(/[\x00-\x09\x0B\x0C\x0E-\x1F\x7F]/g, "") : text;
 }
 
-// ── Deferred mode (таймаут MCP + GetResult) ──
-export const deferredState = { active: false, segments: [], toolCalls: [], cursor: 0, finished: false, error: null, opts: null };
+// ── Deferred jobs (таймаут MCP + GetResult) ──
+// Одно задание = один запрос к Напарнику со своим стримом, сегментами и курсором.
+const JOB_TTL_MS = 30 * 60 * 1000;          // завершённые задания живут 30 минут
+const JOB_ACTIVE_TIMEOUT_MS = 15 * 60 * 1000; // watchdog активного задания
+const JOB_MAX = 20;
+
+const jobs = new Map();
+let lastJobId = null;
+
+function newJobId() {
+  return "req_" + randomUUID().slice(0, 8);
+}
+
+function trimJobs() {
+  const now = Date.now();
+  for (const [id, job] of jobs) {
+    if (job.finished && job.finishedAt && now - job.finishedAt > JOB_TTL_MS) jobs.delete(id);
+  }
+  if (jobs.size > JOB_MAX) {
+    const done = [...jobs.values()]
+      .filter(j => j.finished)
+      .sort((a, b) => a.finishedAt - b.finishedAt);
+    for (const job of done) {
+      if (jobs.size <= JOB_MAX) break;
+      jobs.delete(job.id);
+    }
+  }
+  if (lastJobId && !jobs.has(lastJobId)) lastJobId = null;
+}
+
+function notify(job) {
+  const waiters = job.waiters.splice(0);
+  for (const wake of waiters) wake();
+}
+
+export function createJob({ kind = "ask", convUuid = null, opts = {} } = {}) {
+  const job = {
+    id: newJobId(),
+    kind,
+    convUuid,
+    opts,
+    segments: [],
+    toolCalls: [],
+    cursor: 0,
+    partial: "",
+    partialDelivered: "",
+    usage: null,
+    maxContext: null,
+    active: true,
+    finished: false,
+    error: null,
+    createdAt: Date.now(),
+    finishedAt: 0,
+    waiters: [],
+    controller: new AbortController(),
+    timer: null,
+  };
+  job.timer = setTimeout(() => {
+    if (job.finished) return;
+    try { job.controller.abort(); } catch { /* ignore */ }
+    finishJob(job, new ApiError("Превышено время ожидания ответа (15 мин)", { status: 0 }));
+  }, JOB_ACTIVE_TIMEOUT_MS);
+  if (job.timer.unref) job.timer.unref();
+
+  jobs.set(job.id, job);
+  lastJobId = job.id;
+  trimJobs();
+  return job;
+}
+
+export function finishJob(job, error = null) {
+  if (!job || job.finished) return;
+  job.error = error || null;
+  job.finished = true;
+  job.active = false;
+  job.finishedAt = Date.now();
+  if (job.timer) clearTimeout(job.timer);
+  notify(job);
+  trimJobs();
+}
+
+export function dropJob(job) {
+  if (!job) return;
+  if (job.timer) clearTimeout(job.timer);
+  try { job.controller?.abort(); } catch { /* ignore */ }
+  jobs.delete(job.id);
+  if (lastJobId === job.id) lastJobId = null;
+}
+
+export function dropJobs(predicate) {
+  for (const job of [...jobs.values()]) {
+    if (predicate(job)) dropJob(job);
+  }
+}
+
+export function activeJob(kind) {
+  return [...jobs.values()].find(j => j.kind === kind && j.active) || null;
+}
+
+function pickJob(requestId) {
+  if (requestId) return jobs.get(requestId) || null;
+  const byDate = [...jobs.values()].sort((a, b) => b.createdAt - a.createdAt);
+  return (lastJobId && jobs.get(lastJobId)) || byDate[0] || null;
+}
+
+function formatK(n) {
+  const v = Math.round(Number(n) || 0);
+  return v >= 1000 ? `${Math.round(v / 1000)}k` : String(v);
+}
+
+function contextLine(job) {
+  if (!job.opts?.showContext || !job.usage) return "";
+  const used = (job.usage.prompt_tokens || 0) + (job.usage.completion_tokens || 0);
+  const max = job.maxContext || 0;
+  const pct = max ? ` (${Math.round((used / max) * 100)}%)` : "";
+  return `📊 Контекст: ≈${formatK(used)}${max ? ` / ${formatK(max)}` : ""}${pct}`;
+}
 
 /**
- * Получить результат отложенного стрима (для GetResult).
- * Каждый вызов возвращает новые сегменты, накопленные с прошлого раза.
- * Возвращает { text, finished } или null если нет активного deferred.
+ * Результат задания для GetResult.
+ * Возвращает { text, finished, failed?, jobId } или null, если задания нет.
  */
-export function getDeferredResult() {
-  if (!deferredState.active && deferredState.cursor >= deferredState.segments.length) return null;
-  const segs = deferredState.segments.slice(deferredState.cursor);
-  deferredState.cursor = deferredState.segments.length;
-  if (!segs.length && !deferredState.finished) return { text: "⏳ Модель ещё думает...", finished: false };
-  const text = buildResult(segs, deferredState.toolCalls.slice(), deferredState.opts || {});
-  const finished = deferredState.finished;
-  if (finished) {
-    deferredState.active = false;
+export async function getJobResult({ requestId, waitSeconds = 0 } = {}) {
+  const job = pickJob(requestId);
+  if (!job) return null;
+
+  const waitMs = Math.min(Math.max(Number(waitSeconds) || 0, 0), 25) * 1000;
+  const deadline = Date.now() + waitMs;
+  while (true) {
+    const hasSegments = job.cursor < job.segments.length;
+    if (hasSegments || job.finished || job.error) break;
+    const left = deadline - Date.now();
+    if (left <= 0) break;
+    await new Promise(resolve => {
+      const timer = setTimeout(resolve, left);
+      job.waiters.push(() => { clearTimeout(timer); resolve(); });
+    });
   }
-  let result = { text, finished };
-  if (finished && text) {
-    result.text = text + "\n\n⚠️ **Модель закончила ответ.**";
+
+  if (job.error) {
+    return { text: `❌ ${job.error.message || job.error}`, finished: true, failed: true, jobId: job.id, error: job.error };
   }
-  return result;
+
+  const segments = job.segments.slice(job.cursor);
+  job.cursor = job.segments.length;
+
+  if (!segments.length) {
+    if (job.finished) {
+      const parts = [];
+      if (job.opts?.showContext && !job.contextDelivered) {
+        job.contextDelivered = true;
+        const line = contextLine(job);
+        if (line) parts.push(line);
+      }
+      if (!job.finishedNoticeDelivered) {
+        job.finishedNoticeDelivered = true;
+        parts.push("✅ Модель закончила ответ.");
+      }
+      return { text: parts.join("\n"), finished: true, jobId: job.id };
+    }
+    return { text: "⏳ Модель ещё думает...", finished: false, jobId: job.id };
+  }
+
+  let text = buildResult(segments, job.toolCalls.slice(), job.opts || {});
+  // Часть текста уже отдавали в deferred-ответе Ask — не дублируем её.
+  if (job.partialDelivered && text.startsWith(job.partialDelivered)) {
+    text = text.slice(job.partialDelivered.length).trimStart();
+  }
+  if (!text && !job.finished) {
+    return { text: "⏳ Модель ещё думает...", finished: false, jobId: job.id };
+  }
+  if (job.finished) {
+    const tailParts = [];
+    if (!job.finishedNoticeDelivered) {
+      job.finishedNoticeDelivered = true;
+      tailParts.push("⚠️ **Модель закончила ответ.**");
+    }
+    if (job.opts?.showContext && !job.contextDelivered) {
+      job.contextDelivered = true;
+      const line = contextLine(job);
+      if (line) tailParts.push(line);
+    }
+    if (tailParts.length) {
+      const tail = tailParts.join("\n");
+      text = text ? `${text}\n\n${tail}` : tail;
+    }
+  }
+  return { text, finished: job.finished, jobId: job.id };
 }
 
 /**
@@ -75,162 +233,64 @@ export class ChatClient {
   }
 
   async createConversation(skillName = "custom", title) {
-    log(`  💬 askAI: создание конверсации (skill=${skillName})...`);
-    const isSkill = skillName !== "custom";
-    const convBody = {
-      skill_name: skillName,
-      ui_language: "russian",
-      programming_language: isSkill ? "1с" : "",
-      is_chat: true,
-      user_instruct: { common_rules: null, workspace_rules: null, projects_rules: {} },
-    };
-    if (isSkill) convBody.script_language = "Russian";
-    const res = await fetch(`${BASE_URL}/chat_api/v1/conversations/`, {
-      method: "POST",
-      headers: chatHeaders(),
-      body: JSON.stringify(convBody),
-    });
-    trace("conv_create", { skillName, title, status: res.status });
-    if (!res.ok) {
-      const body = await res.text();
-      if (res.status === 401 || res.status === 403) { resetSession(); throw new RetrySessionError(); }
-      throw new Error(`create_conversation: ${res.status} ${body}`);
-    }
-    const data = await res.json();
-    this.convUuid = data.uuid;
+    log(`  💬 askAI: создание конверсации (mode=${TRANSPORT_CAPABILITIES.mode}, skill=${skillName})...`);
+    const uuid = await createConversationRequest({ skillName, title });
+    this.convUuid = uuid;
 
     // Устанавливаем название чата
     if (title) {
       try {
-        await fetch(`${BASE_URL}/chat_api/v1/conversations/${this.convUuid}/title`, {
-          method: "PUT",
-          headers: chatHeaders(),
-          body: JSON.stringify({ title: title.slice(0, 100) }),
-        });
+        await setConversationTitle(uuid, title);
       } catch { /* ignore errors on title set */ }
     }
 
     // Регистрируем в кэше (на случай краша)
-    addConversation({ uuid: this.convUuid, title, skill: skillName });
-    log(`  💬 askAI: конверсация ${this.convUuid.slice(0, 8)}…`);
-    return this.convUuid;
+    addConversation({ uuid, title, skill: skillName });
+    log(`  💬 askAI: конверсация ${uuid.slice(0, 8)}…`);
+    return uuid;
   }
 
-  async sendUserMessage(text, code, skillName) {
-    const isSkill = skillName && skillName !== "custom";
-    let content;
-    if (isSkill) {
-      content = {
-        code: code ? [{ content: code, path: "/" }] : [],
-        local_context: {
-          prefix: "",
-          suffix: code || "",
-          path: "/",
-          offset: 0,
-          forced: false,
-          content_assist: false,
-          programing_language: "1с",
-          cursor_object: "",
-          current_method: "",
-          cursor_environments: ["THIN_CLIENT", "MNG_CLIENT", "MOBILE_CLIENT", "WEB_CLIENT", "MOBILE_THIN_CLIENT", "CLIENT"],
-          related_objects: [],
-          related_functions: [],
-        },
-      };
-      if (text) content.instruction = text;
-    } else {
-      content = {};
-      if (text) content.instruction = text;
-    }
-
-    const body = {
-      parent_uuid: this.lastAssistantUuid,
-      role: "user",
-      content: { content, tools: LOCAL_TOOL_DEFS },
-    };
+  async sendUserMessage(text, code, skillName, signal) {
     log(`  💬 askAI: отправка (parent=${this.lastAssistantUuid ? this.lastAssistantUuid.slice(0, 8) + "…" : "null"})...`);
-    trace("send_msg_req", { parentUuid: this.lastAssistantUuid, body });
-    const res = await fetch(`${BASE_URL}/chat_api/v1/conversations/${this.convUuid}/messages`, {
-      method: "POST",
-      headers: chatHeaders("text/event-stream"),
-      body: JSON.stringify(body),
+    return await sendUserMessageRequest(this.convUuid, {
+      text,
+      code,
+      skillName,
+      parentUuid: this.lastAssistantUuid,
+      signal,
     });
-    if (!res.ok) {
-      const errBody = await res.text();
-      if (res.status === 401 || res.status === 403) { resetSession(); throw new RetrySessionError(); }
-      if (res.status === 404) { this.convUuid = null; this.lastAssistantUuid = null; throw new RetrySessionError(); }
-      throw new Error(`send_message: ${res.status} ${errBody}`);
-    }
-    return res;
   }
 
-  async sendToolAck(assistantUuid, calls) {
-    const serverCalls = [];
-    const results = [];
+  async sendToolAck(assistantUuid, calls, signal) {
+    const entries = [];
 
     for (const tc of calls) {
       const name = tc.function?.name || tc.name;
+      const id = tc.id || tc.tool_call_id;
       if (LOCAL_TOOLS.has(name)) {
         try {
           const args = JSON.parse(tc.function?.arguments || "{}");
           log(`  💻 локальный тул: ${name}(${JSON.stringify(args).slice(0, 100)})`);
           const result = executeLocalTool(name, args);
           const content = (result.content || "").slice(0, TOOL_CONTENT_MAX_CHARS);
-          results.push({ content, tool_call_id: tc.id, name });
+          entries.push({ content, tool_call_id: id, name, status: "ok" });
         } catch (err) {
           log(`  ❌ ошибка тула ${name}: ${err.message}`);
-          results.push({ content: `Error: ${err.message}`, tool_call_id: tc.id, name, status: "error" });
+          entries.push({ content: `Error: ${err.message}`, tool_call_id: id, name, status: "error" });
         }
       } else {
-        serverCalls.push(tc);
+        entries.push({ content: null, tool_call_id: id, name, status: "accepted" });
       }
     }
 
-    // Отправляем результаты локальных тулов
-    if (results.length) {
-      const body = {
-        parent_uuid: assistantUuid,
-        role: "tool",
-        content: results.map(r => ({ content: r.content || "", tool_call_id: r.tool_call_id, name: r.name, status: r.status || "ok" })),
-      };
-      log(`  💬 askAI: результат локальных тулов (${results.map(r => r.name).join(", ")})`);
-      trace("tool_result_req", { names: results.map(r => r.name), body });
-    const res = await fetch(`${BASE_URL}/chat_api/v1/conversations/${this.convUuid}/messages`, {
-      method: "POST",
-      headers: chatHeaders("text/event-stream"),
-      body: JSON.stringify(body),
-    });
-      if (!res.ok) {
-        const errBody = await res.text();
-        if (res.status === 401 || res.status === 403) throw new RetrySessionError();
-        throw new Error(`tool_result: ${res.status} ${errBody}`);
-      }
-      // Если есть ещё серверные — следующая итерация цикла их обработает
-      if (serverCalls.length) return res;
-      return res;
-    }
+    if (!entries.length) return null;
 
-    // Только серверные тулы — обычный ACK
-    if (!serverCalls.length) return null;
+    const local = entries.filter(e => e.status !== "accepted");
+    const server = entries.filter(e => e.status === "accepted");
+    if (local.length) log(`  💬 askAI: результат локальных тулов (${local.map(e => e.name).join(", ")})`);
+    if (server.length) log(`  💬 askAI: ACK серверных тулов (${server.map(e => e.name).join(", ")})`);
 
-    const body = {
-      parent_uuid: assistantUuid,
-      role: "tool",
-      content: serverCalls.map(tc => ({ content: null, tool_call_id: tc.id, name: tc.function?.name || tc.name, status: "accepted" })),
-    };
-    log(`  💬 askAI: ACK серверных тулов (${serverCalls.map(t => t.function?.name || t.name).join(", ")})`);
-    trace("tool_ack_req", { names: serverCalls.map(t => t.function?.name || t.name), body });
-    const res = await fetch(`${BASE_URL}/chat_api/v1/conversations/${this.convUuid}/messages`, {
-      method: "POST",
-      headers: chatHeaders("text/event-stream"),
-      body: JSON.stringify(body),
-    });
-    if (!res.ok) {
-      const errBody = await res.text();
-      if (res.status === 401 || res.status === 403) throw new RetrySessionError();
-      throw new Error(`tool_ack: ${res.status} ${errBody}`);
-    }
-    return res;
+    return await sendToolResultsRequest(this.convUuid, { parentUuid: assistantUuid, entries, signal });
   }
 
   /**
@@ -238,6 +298,20 @@ export class ChatClient {
    * Модифицирует ctx { segments, toolCalls, answer, reasoning, assistantUuid, pendingToolName } на месте.
    */
   processEvent(event, ctx) {
+    // Ошибка может прийти отдельным SSE-пакетом при HTTP 200.
+    if (event.error || event.error_type) {
+      const msg = typeof event.error === "string"
+        ? event.error
+        : (event.error?.message || (event.error ? JSON.stringify(event.error) : "ошибка в потоке ответа"));
+      throw new ApiError(`stream: ${event.error_type ? event.error_type + ": " : ""}${msg}`, {
+        status: 0,
+        type: event.error_type || "",
+      });
+    }
+
+    // Эхо пользовательского сообщения (первый пакет) и прочие role: user не относятся к ответу.
+    if (event.role === "user") return;
+
     if (event.uuid && event.role === "assistant") {
       ctx.assistantUuid = event.uuid;
       ctx.pendingToolName = null;
@@ -294,11 +368,16 @@ export class ChatClient {
     }
 
     if (event.finished) {
+      if (event.details) {
+        if (event.details.usage) ctx.usage = event.details.usage;
+        if (event.details.max_context_length) ctx.maxContext = event.details.max_context_length;
+      }
       if (event.content?.content && event.role !== "tool") {
         let text = typeof event.content.content === "string" ? event.content.content : event.content.content?.text || "";
         if (text) {
           text = sanitizeText(text.replace(/\\n/g, "\n"));
-          if (text.length > ctx.answer.length) ctx.answer = text;
+          // По контракту финальный content приоритетнее накопленных дельт.
+          ctx.answer = text;
         }
       }
       if (ctx.reasoning) {
@@ -331,16 +410,20 @@ export class ChatClient {
   /**
    * Фоновый цикл чтения SSE: читает стрим, обрабатывает события,
    * самостоятельно отправляет tool ACK.
-   * Всё накопленное кладёт в deferredState.
+   * Всё накопленное пишет в своё задание (job), а не в глобальное состояние.
    */
-  async bgLoop(response) {
+  async bgLoop(job, response) {
     let currentRes = response;
     let assistantUuid = null;
 
-    while (true) {
-      try {
+    try {
+      while (true) {
         const reader = createSSEReader(currentRes);
-        const ctx = { segments: [], toolCalls: [], answer: "", reasoning: "", assistantUuid: null, pendingToolName: null, pendingToolCallId: null };
+        const ctx = {
+          segments: [], toolCalls: [], answer: "", reasoning: "",
+          assistantUuid: null, pendingToolName: null, pendingToolCallId: null,
+          usage: null, maxContext: null,
+        };
 
         while (true) {
           const { done, events } = await reader.read();
@@ -348,18 +431,21 @@ export class ChatClient {
           for (const event of events) {
             trace("sse_event", event);
             this.processEvent(event, ctx);
-            for (const seg of ctx.segments) {
-              deferredState.segments.push(seg);
-            }
+            for (const seg of ctx.segments) job.segments.push(seg);
             ctx.segments = [];
+            if (ctx.usage) job.usage = ctx.usage;
+            if (ctx.maxContext) job.maxContext = ctx.maxContext;
+            job.partial = ctx.answer;
+            notify(job);
           }
         }
 
         this.flushAccumulated(ctx);
-        for (const seg of ctx.segments) {
-          deferredState.segments.push(seg);
-        }
+        for (const seg of ctx.segments) job.segments.push(seg);
         ctx.segments = [];
+        job.partial = "";
+        if (ctx.usage) job.usage = ctx.usage;
+        if (ctx.maxContext) job.maxContext = ctx.maxContext;
 
         if (ctx.assistantUuid) {
           assistantUuid = ctx.assistantUuid;
@@ -367,7 +453,7 @@ export class ChatClient {
         }
 
         for (const tc of ctx.toolCalls) {
-          deferredState.toolCalls.push({
+          job.toolCalls.push({
             id: tc.id || tc.tool_call_id,
             name: tc.function?.name || tc.name || "?",
             args: (() => { try { return JSON.stringify(JSON.parse(tc.function?.arguments || "{}")); } catch { return tc.function?.arguments || ""; } })(),
@@ -376,22 +462,18 @@ export class ChatClient {
 
         if (ctx.toolCalls.length > 0) {
           trace("tool_ack_loop", { toolCallsCount: ctx.toolCalls.length, assistantUuid: (assistantUuid || this.lastAssistantUuid)?.slice(0, 8) });
-          currentRes = await this.sendToolAck(assistantUuid || this.lastAssistantUuid, ctx.toolCalls);
-          if (!currentRes?.body) { deferredState.finished = true; break; }
+          currentRes = await this.sendToolAck(assistantUuid || this.lastAssistantUuid, ctx.toolCalls, job.controller?.signal);
+          if (!currentRes?.body) { finishJob(job); break; }
           continue;
         }
 
-        deferredState.finished = true;
-        deferredState.active = false;
-        trace("all_segments", deferredState.segments);
-        return;
-      } catch (err) {
-        log(`  ⚠️ bgLoop error: ${err.message || err}`);
-        deferredState.error = err;
-        deferredState.finished = true;
-        deferredState.active = false;
+        finishJob(job);
+        trace("all_segments", job.segments);
         return;
       }
+    } catch (err) {
+      log(`  ⚠️ bgLoop error: ${err.message || err}`);
+      finishJob(job, err);
     }
   }
 
@@ -405,7 +487,10 @@ export class ChatClient {
     const deferredMs = opts.deferredMs || 0;
     const showReasoning = opts.showReasoning ?? false;
     const showToolLog = opts.showToolLog ?? false;
+    const jobOpts = { showReasoning, showToolLog, stripMarkdown: true, showContext: opts.showContext ?? false };
+
     for (let attempt = 0; attempt < 2; attempt++) {
+      let job = null;
       try {
         if (opts.freshConv || !this.convUuid) {
           if (this.convUuid && opts.freshConv) {
@@ -417,16 +502,16 @@ export class ChatClient {
           log(`  💬 askAI: конверсация ${this.convUuid.slice(0, 8)}… (существующая)`);
         }
 
-        const res = await this.sendUserMessage(question, code, opts.skillName);
-        deferredState.opts = { showReasoning, showToolLog, stripMarkdown: true };
-        deferredState.active = true;
-        deferredState.segments = [];
-        deferredState.toolCalls = [];
-        deferredState.cursor = 0;
-        deferredState.finished = false;
-        deferredState.error = null;
+        job = createJob({ kind: opts.kind || "ask", convUuid: this.convUuid, opts: jobOpts });
+        let res;
+        try {
+          res = await this.sendUserMessage(question, code, opts.skillName, job.controller.signal);
+        } catch (err) {
+          finishJob(job, err);
+          throw err;
+        }
 
-        const bgPromise = this.bgLoop(res);
+        const bgPromise = this.bgLoop(job, res);
         if (opts.freshConv) {
           bgPromise.finally(() => {
             if (this.convUuid) return this.deleteConversation().catch(() => {});
@@ -444,37 +529,62 @@ export class ChatClient {
           await bgPromise;
         }
 
-        if (deferredState.error instanceof RetrySessionError) {
-          throw deferredState.error;
-        }
-        if (deferredState.error && !wasDeferred) {
-          log(`  ⚠️ bgLoop error: ${deferredState.error}`);
-          throw new Error(typeof deferredState.error === "string" ? deferredState.error : "bgLoop завершился с ошибкой");
+        if (job.error) {
+          if (job.error instanceof RetrySessionError || job.error.retrySession || job.error.conversationGone || job.error.status === 404) {
+            throw job.error;
+          }
+          if (!wasDeferred) throw job.error;
         }
 
-        const segs = [...deferredState.segments];
-        const toolCalls = [...deferredState.toolCalls];
-        deferredState.cursor = deferredState.segments.length;
+        if (wasDeferred) {
+          const segText = buildResult(job.segments, job.toolCalls.slice(), jobOpts);
+          // Сегменты уже отданы в deferred-ответе — сдвигаем курсор.
+          job.cursor = job.segments.length;
+          const partial = job.partial ? `🤖 ${job.partial}` : "";
+          job.partialDelivered = partial;
+          const text = [segText, partial].filter(Boolean).join("\n\n") || "⏳ Модель ещё думает...";
+          log(`  💬 askAI: deferred ${job.id} (${text.length} символов)`);
+          trace("askAI_deferred", { jobId: job.id, length: text.length });
+          return { text, deferred: true, jobId: job.id };
+        }
 
-        let result = buildResult(segs, toolCalls, { showReasoning, showToolLog, stripMarkdown: true });
-        if (!result && !wasDeferred) {
-          if (toolCalls.length > 0) {
+        let result = buildResult(job.segments, job.toolCalls.slice(), jobOpts);
+        if (!result) {
+          if (job.toolCalls.length > 0) {
             result = "⚠️ Модель исчерпала лимит итераций инструментов. Финальный ответ не получен.\n"
-              + (showToolLog ? `🔧 Использованы инструменты: ${[...new Set(toolCalls.map(t => t.name))].join(", ")}\n` : "");
+              + (showToolLog ? `🔧 Использованы инструменты: ${[...new Set(job.toolCalls.map(t => t.name))].join(", ")}\n` : "");
           } else {
             throw new Error("AI не вернул текстовый ответ");
           }
         }
 
-        log(`  💬 askAI: ответ (${result.length} символов${wasDeferred ? ", deferred" : ""})`);
-        trace("askAI_result", { length: result.length, answerPreview: result.slice(0, 500), toolCalls: toolCalls.map(t => t.name), wasDeferred });
-        return { text: result, deferred: wasDeferred };
+        const ctxLine = contextLine(job);
+        if (ctxLine) result += `\n\n${ctxLine}`;
+
+        // Ответ уже отдан целиком — помечаем задание прочитанным.
+        job.cursor = job.segments.length;
+        job.finishedNoticeDelivered = true;
+        job.contextDelivered = true;
+
+        log(`  💬 askAI: ответ (${result.length} символов, ${job.id})`);
+        trace("askAI_result", { jobId: job.id, length: result.length, answerPreview: result.slice(0, 500), toolCalls: job.toolCalls.map(t => t.name) });
+        return { text: result, deferred: false, jobId: job.id };
       } catch (err) {
-        if (err instanceof RetrySessionError && attempt === 0) {
-          log(`  🔄 Пересоздание сессии (попытка 2)...`);
-          this.convUuid = null;
-          this.lastAssistantUuid = null;
-          continue;
+        if (job && attempt === 0) dropJob(job);
+        if (attempt === 0) {
+          if (err instanceof RetrySessionError || err.retrySession) {
+            log(`  🔄 Пересоздание сессии (попытка 2)...`);
+            resetSession();
+            this.convUuid = null;
+            this.lastAssistantUuid = null;
+            continue;
+          }
+          if (err.conversationGone || err.status === 404) {
+            log(`  🔄 Диалог не найден, создаю новый (попытка 2)...`);
+            this.convUuid = null;
+            this.lastAssistantUuid = null;
+            continue;
+          }
         }
         throw err;
       }
@@ -486,10 +596,7 @@ export class ChatClient {
     const uuid = this.convUuid;
     this.convUuid = null;
     removeConversation(uuid);
-    await fetch(`${BASE_URL}/chat_api/v1/conversations/${uuid}`, {
-      method: "DELETE",
-      headers: chatHeaders(),
-    });
+    await deleteConversationRequest(uuid);
   }
 }
 
@@ -659,6 +766,13 @@ function buildResult(allSegments, toolCalls, { showReasoning, showToolLog, strip
         }
         break;
     }
+  }
+
+  // В public API нет render_info — показываем хотя бы имена и аргументы вызванных тулов.
+  if (showToolLog && calls.size === 0 && toolCalls?.length) {
+    segmentParts.push(toolCalls.map(tc =>
+      `🛠️ **${tc.name}**${tc.args ? `: ${String(tc.args).slice(0, 300)}` : ""}`
+    ).join("\n"));
   }
 
   if (showToolLog) {

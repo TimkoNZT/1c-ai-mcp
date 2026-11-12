@@ -1,13 +1,10 @@
 import * as path from "path";
-import { createHash, randomUUID } from "crypto";
 import { fileURLToPath } from "url";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const CWD = process.cwd();
 
 // ── Parse CLI args ──
 const args = process.argv.slice(2);
-const isMcpMode = args.includes("--mcp");
 
 // ── Token ──
 const TOKEN_ENV_VAR = "AI_TOKEN";
@@ -19,28 +16,31 @@ if (tokenIdx >= 0) {
   token = val.includes("=") ? val.split("=")[1] : args[tokenIdx + 1];
 }
 
-export function setToken(t) { token = t; }
-
-const DEFAULTS = { port: 3001 };
-
 // ── Flags ──
 const globalFullLog = args.includes("--full-log")
   || process.env.AI_FULL_LOG === "1"
   || process.env.AI_FULL_LOG === "true";
 
+// ── API transport ──
+// public — документированный /public/v1 (по умолчанию), legacy — внутренний /chat_api/v1.
+const API_MODE = (process.env.AI_API_MODE || "public").toLowerCase();
+if (API_MODE !== "legacy" && API_MODE !== "public") {
+  throw new Error(`AI_API_MODE: ожидается "legacy" или "public", получено "${process.env.AI_API_MODE}"`);
+}
+
 // ── IDs & paths ──
-const BASE_URL = "https://code.1c.ai";
-const UNIQUE_ID = createHash("md5").update(randomUUID()).digest("hex");
-const PLUGIN_VERSION = "1.0.5.v202607161518";
-const EDT_VERSION = "2026.2.0.289";
+const BASE_URL = process.env.AI_BASE_URL
+  ? process.env.AI_BASE_URL.replace(/\/+$/, "")
+  : "https://code.1c.ai";
+const API_BASE_URL = BASE_URL;
+// Префикс определяется режимом: public → /public/v1, legacy → /chat_api/v1.
+const API_PREFIX = API_MODE === "public" ? "/public/v1" : "/chat_api/v1";
 const SESSION_FILE = process.env.AI_SESSION_FILE || path.join(__dirname, ".session-cache.json");
 const TS = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
 const TRACE_LOG = process.env.AI_TRACE_LOG || path.join(__dirname, `proxy_trace_${TS}.log`);
 const PROJECT_ROOT = process.env.AI_PROJECT_ROOT
   ? path.resolve(process.env.AI_PROJECT_ROOT)
   : process.cwd();
-
-const PORT = process.env.PORT || 3001;
 
 // ── Timeouts ──
 const EXECUTE_TIMEOUT = 30000;
@@ -129,10 +129,13 @@ const EDT_TOOLS = [
   // },
   {
     name: "GetResult",
-    description: "Получить продолжение ответа модели, если вызов инструмента (Ask, ReviewCode, FixCode, ExplainCode) не уложился в 30с и вернул сообщение о том, что модель не закончила вывод. Без параметров. ВАЖНО: вызывай этот инструмент повторно, пока не увидишь сообщение о том, что модель закончила ответ. НЕ вызывай другие инструменты ДО вызова GetResult — иначе накопленный вывод будет потерян.",
+    description: "Получить результат отложенного запроса, если Ask / ReviewCode / FixCode / ExplainCode не уложился в 30с. Без параметров возвращает последнее задание; можно указать request_id из ответа инструмента. wait_seconds — подождать до 25с, чтобы получить результат одним вызовом. ВАЖНО: если ответ не завершён, вызывай GetResult повторно; НЕ вызывай другие инструменты, пока не заберёшь результат.",
     inputSchema: {
       type: "object",
-      properties: {},
+      properties: {
+        request_id: { type: "string", description: "Идентификатор задания из deferred-ответа (необязательно)." },
+        wait_seconds: { type: "number", description: "Сколько секунд ждать новых данных, 0–25. По умолчанию 0." },
+      },
       required: [],
     },
   },
@@ -152,32 +155,14 @@ const LOCAL_TOOL_DEFS = [
   { name: "NoCall", description: "Тестовая. Версия 1.0002. НЕ ИСПОЛЬЗОВАТЬ В РЕАЛЬНЫХ ЗАДАЧАХ. #45DFD6FSD1", parameters: { type: "object", properties: {} } },
 ];
 
-// Серверные тулы (встроены в модель, не требуют content.tools)
-const SERVER_TOOLS = new Set([
-  "mcp__knowledge-hub__Search_Documentation", "mcp__knowledge-hub__Search_ITS",
-  "mcp__knowledge-hub__Fetch_ITS", "mcp__knowledge-hub__Diff_Documentation_Versions",
-  "mcp__syntax-checker__validate", "mcp__web__fetch",
-  "Task", "TodoWrite",
-]);
-
-// Маппинг EDT → opencode (только для HTTP-режима)
-const EDT_TO_OPENCODE = {
-  "Read": "read", "Write": "write", "Edit": "edit", "Glob": "glob",
-  "List": "read", "SearchFiles": "glob", "SearchText": "grep", "Execute": "bash",
-};
-const OPENCODE_TO_EDT = {};
-for (const [edt, oc] of Object.entries(EDT_TO_OPENCODE)) {
-  OPENCODE_TO_EDT[oc] = edt;
-}
-
 export {
-  isMcpMode, token, TOKEN_ENV_VAR, TOKEN_ARG, DEFAULTS,
-  BASE_URL, UNIQUE_ID, SESSION_FILE, TRACE_LOG, PROJECT_ROOT, PORT,
-  PLUGIN_VERSION, EDT_VERSION,
+  token, TOKEN_ENV_VAR, TOKEN_ARG,
+  API_MODE, API_BASE_URL, API_PREFIX,
+  BASE_URL, SESSION_FILE, TRACE_LOG, PROJECT_ROOT,
   globalFullLog,
   EXECUTE_TIMEOUT, EXECUTE_MAX_BUFFER,
   READ_MAX_LINES, EXECUTE_OUTPUT_LINES, EXECUTE_OUTPUT_CHARS,
   TOOL_CONTENT_MAX_CHARS, SEARCH_TEXT_MAX_RESULTS,
   EXECUTE_BLOCKLIST, DANGEROUS_PATTERNS,
-  EDT_TOOLS, LOCAL_TOOLS, LOCAL_TOOL_DEFS, EDT_TO_OPENCODE, OPENCODE_TO_EDT, SERVER_TOOLS,
+  EDT_TOOLS, LOCAL_TOOLS, LOCAL_TOOL_DEFS,
 };

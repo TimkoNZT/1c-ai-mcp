@@ -2,7 +2,7 @@ param([switch]$Force)
 
 $src = @(
   "config.js", "logger.js", "session.js", "tools.js",
-  "sse-reader.js", "chat-client.js", "mcp-handler.js", "index.js"
+  "sse-reader.js", "transport.js", "chat-client.js", "mcp-handler.js", "index.js"
 )
 $proxyDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $srcDir = Join-Path $proxyDir "src"
